@@ -219,26 +219,50 @@ func (p *Pool) newConn() (cn *conn, err error) {
 	}, nil
 }
 
-// borrowConn borrows a connection from the pool.
+// borrowConn borrows a connection from the pool. It ensures the connection is active by
+// performing a NOOP command. If no active connection is available, it attempts to create a new one.
 func (p *Pool) borrowConn() (*conn, error) {
-	// If there are no connections in the pool and if there is room for new
-	// connections, create a new connection. Locks are used ad-hoc to avoid
-	// locking when IO bound newConn() is happening.
-	switch {
-	case p.closed.Load():
+	// Check if the pool has been marked as closed. If so, return an error immediately.
+	if p.closed.Load() {
 		return nil, ErrPoolClosed
-	case int(p.createdConns.Load()) <= p.opt.MaxConns && len(p.conns) == 0:
-		p.createdConns.Add(1)
-		return p.newConn()
 	}
 
-	select {
-	case c := <-p.conns:
-		return c, nil
-	case <-p.stopBorrow:
-		return nil, ErrPoolClosed
-	case <-time.After(p.opt.PoolWaitTimeout):
-		return nil, errors.New("timed out waiting for free conn in pool")
+	// Attempt to create a new connection if the pool is not at maximum capacity.
+	attemptNewConnection := func() (*conn, error) {
+		if int(p.createdConns.Load()) < p.opt.MaxConns {
+			p.createdConns.Add(1) // Safely increment the count of created connections.
+			return p.newConn()    // Create a new connection.
+		}
+		return nil, errors.New("max connections reached") // All connections are in use and pool is at capacity.
+	}
+
+	for {
+		select {
+		case c := <-p.conns:
+			// Perform a NOOP command to check if the connection is alive.
+			if err := c.conn.Noop(); err == nil {
+				return c, nil // The connection is valid, return it.
+			} else {
+				// If NOOP fails, the connection is considered stale. Decrement the counter and close the connection.
+				p.createdConns.Add(-1)
+				c.conn.Close()
+				// Try to create a new connection if the pool has capacity.
+				if cn, err := attemptNewConnection(); err == nil {
+					return cn, nil
+				}
+			}
+		case <-p.stopBorrow:
+			// The pool is closing, return an error.
+			return nil, ErrPoolClosed
+		case <-time.After(p.opt.PoolWaitTimeout):
+			// Timeout occurred while waiting for a connection to become available.
+			// Try to create a new connection if the pool is not at capacity.
+			if cn, err := attemptNewConnection(); err == nil {
+				return cn, nil
+			}
+			// If a new connection can't be created, return a timeout error.
+			return nil, errors.New("timed out waiting for free conn in pool")
+		}
 	}
 }
 
